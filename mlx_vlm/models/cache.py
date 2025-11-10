@@ -3,6 +3,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache, _BaseCache
+from mlx_lm.models.base import create_causal_mask
 
 
 def make_prompt_cache(
@@ -228,3 +229,133 @@ class StaticKVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+
+class BatchKVCache(_BaseCache):
+    step = 256
+
+    def __init__(self, left_padding: List[int]):
+        """
+        The BatchKV cache expects inputs to be left-padded.
+
+        E.g. the following prompts:
+
+            [1, 3, 5]
+            [7]
+            [2, 6, 8, 9]
+
+        Should be padded like so:
+
+            [0, 1, 3, 5]
+            [0, 0, 0, 7]
+            [2, 6, 8, 9]
+
+        And ``left_padding`` specifies the amount of padding for each.
+        In this case, ``left_padding = [1, 3, 0]``.
+        """
+        self.keys = None
+        self.values = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = 0
+        self.rope_deltas = None
+
+    def update_and_fetch(self, keys, values):
+        prev = self.offset
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.offset += keys.shape[2]
+        self.keys[..., prev : self.offset, :] = keys
+        self.values[..., prev : self.offset, :] = values
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    @property
+    def state(self):
+        k, v = self.keys, self.values
+        if self.offset < k.shape[2]:
+            k = k[..., : self.offset, :]
+            v = v[..., : self.offset, :]
+        return k, v, self.left_padding
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.left_padding = v
+        self.offset = self.keys.shape[2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self.offset, left_padding=self.left_padding, **kwargs
+        )
+
+    def filter(self, batch_indices):
+        """
+        In-place filter to keep just the given indices in the cache.
+        """
+        self.keys = self.keys[batch_indices]
+        self.values = self.values[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+        if self.rope_deltas is not None:
+            self.rope_deltas = self.rope_deltas[batch_indices]
+
+        # Shift left to reduce padding
+        # min_left_pad = self.left_padding.min().item()
+        # if min_left_pad > 0:
+        #     self.keys = self.keys[..., min_left_pad:, :]
+        #     self.values = self.values[..., min_left_pad:, :]
+        #     self.offset -= min_left_pad
+        #     self.left_padding -= min_left_pad
+
+    def extend(self, other):
+        """
+        In-place extend this cache with the other cache.
+        """
+        max_idx = max(self.offset, other.offset)
+        max_size = max(self.keys.shape[2], other.keys.shape[2])
+
+        # Pad the keys and values so they are right-justified
+        # with the index and the same size
+        def pad(c):
+            left = max_idx - c.offset
+            right = max_size - c.keys.shape[2] - left
+            k, v = c.keys, c.values
+            if right < 0:
+                k = k[..., :right, :]
+                v = v[..., :right, :]
+                right = 0
+            if left != 0 or right != 0:
+                pad = [(0, 0), (0, 0), (left, right), (0, 0)]
+                k = mx.pad(k, pad)
+                v = mx.pad(v, pad)
+            left_padding = c.left_padding + left
+            return k, v, left_padding
+
+        self.keys, self.values, self.left_padding = map(
+            mx.concatenate, zip(*(pad(self), pad(other)))
+        )
+        if self.rope_deltas is not None:
+            self.rope_deltas = mx.concatenate(
+                [self.rope_deltas, other.rope_deltas], axis=0
+            )
+        self._idx = max_idx
