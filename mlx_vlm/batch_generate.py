@@ -185,7 +185,7 @@ class BatchGenerator:
         )
         # mx.eval([c.state for c in prompt_cache])
         logits = outputs.logits[:, -1, :]
-        y = mx.argmax(logits, axis=-1)
+        y = self.sampler(logits)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         # y = self.sampler(logprobs)
 
@@ -223,10 +223,7 @@ class BatchGenerator:
         # logits = logits[:, -1, :]
         logits = outputs.logits[:, -1, :]
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        y = mx.argmax(logits, axis=-1)
-        # y = self.sampler(logprobs)
-
-        # Clear intermediate outputs to free memory
+        y = self.sampler(logits)
         del outputs, logits
 
         return y, logprobs
@@ -307,13 +304,13 @@ class BatchGenerator:
             responses.append(self.Response(uid, t, logprobs[e], finish_reason))
 
         # Remove any finished completions
-        if len(end_idx) > 0:
-            print(
-                f"Finished {len(end_idx)} completions.",
-                end_idx,
-                "Remaining:",
-                len(keep_idx),
-            )
+        # if len(end_idx) > 0:
+        #     print(
+        #         f"Finished {len(end_idx)} completions.",
+        #         end_idx,
+        #         "Remaining:",
+        #         len(keep_idx),
+        #     )
         if len(end_idx):
             if len(keep_idx) > 0:
                 batch.filter(keep_idx)
