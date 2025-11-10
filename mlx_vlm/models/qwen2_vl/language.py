@@ -47,7 +47,6 @@ class Qwen2RotaryEmbedding:
         return freqs_t
 
     def __call__(self, x, position_ids):
-
         # In contrast to other models, Qwen3VL has different position ids for the grids
         # So we expand the inv_freq to shape (3, ...)
         if position_ids.ndim == 2:
@@ -162,8 +161,8 @@ class Attention(nn.Module):
 
         cos, sin = self.rotary_emb(values, position_ids)
 
-        if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
+        # if mask is not None and isinstance(mask, mx.array):
+        #     mask = mask[..., : keys.shape[-2]]
         queries, keys = apply_multimodal_rotary_pos_emb(
             queries, keys, cos, sin, unqueeze_dim=1
         )
@@ -246,7 +245,7 @@ class Qwen2Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c, position_ids)
@@ -418,7 +417,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -451,7 +450,6 @@ class LanguageModel(nn.Module):
         cache=None,
         **kwargs,
     ):
-
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
@@ -474,35 +472,28 @@ class LanguageModel(nn.Module):
             # Calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
-                or self.rope_deltas is None
+                or cache[0].rope_deltas is None
                 or cache is None
             ):
                 position_ids, rope_deltas = self.get_rope_index(
                     inputs, image_grid_thw, video_grid_thw, mask
                 )
-                self.rope_deltas = rope_deltas
+                cache[0].rope_deltas = rope_deltas
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self.rope_deltas if cache is not None else 0
+                delta = (
+                    cache[-1].offset + cache[0].rope_deltas if cache is not None else 0
                 )
-                position_ids = mx.arange(seq_length).reshape(1, -1)
+                # delta = delta[None][None]
+                position_ids = mx.arange(seq_length).reshape(1, seq_length)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
+                # if cache is not None:
+                #     # Repeat delta for each batch
+                #     delta = mx.repeat(delta, batch_size // delta.shape[0], axis=0)
 
-                if cache is not None:
-                    if delta.ndim == 0:
-                        delta = mx.expand_dims(delta, axis=0)
-
-                    if delta.shape[0] < batch_size:
-                        # Repeat delta to fill batch
-                        repeats = batch_size // delta.shape[0]
-                        delta = mx.repeat(delta, repeats, axis=0)
-                    else:
-                        # Slice delta to match batch
-                        delta = delta[:batch_size]
-
-                position_ids = mx.add(position_ids, delta)[None, ...]
+                position_ids = position_ids + delta[:, None]
+                # position_ids = mx.add(position_ids, delta).reshape(position_ids.shape)
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
                 )
