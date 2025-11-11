@@ -8,7 +8,7 @@ from mlx_vlm.utils import prepare_inputs
 from mlx_vlm.generate import wired_limit
 from PIL import Image
 from transformers import PreTrainedTokenizer
-
+from mlx_vlm.sample_utils import top_p_sampling
 from .models.cache import BatchKVCache
 
 # from mlx_lm.models.cache import BatchKVCache
@@ -116,31 +116,63 @@ class BatchGenerator:
     def __init__(
         self,
         model,
-        max_tokens: int = 128,
-        stop_tokens: Optional[set] = None,
-        sampler: Optional[Callable[[mx.array], mx.array]] = None,
+        *,
+        max_tokens: int = 256,
         completion_batch_size: int = 100,
         prefill_batch_size: int = 10,
-        prefill_step_size: int = 2048,
+        stop_tokens: Optional[set] = None,
+        temperature: float = 0.0,
+        repetition_penalty: Optional[float] = None,
+        repetition_context_size: Optional[int] = 20,
+        top_p: float = 1.0,
+        logit_bias: Optional[Dict[int, float]] = None,
         **kwargs,
     ):
         self.model = model
         self.unprocessed_prompts = []
         self.max_tokens = max_tokens
         self.stop_tokens = stop_tokens or set()
-        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
         self.uid_count = 0
-        self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
-        # self.prefill_batch_size = completion_batch_size
-        self.prefill_step_size = prefill_step_size
         self.completion_batch_size = completion_batch_size
+
+        self.temperature = temperature
+        self.top_p = top_p
+        self.logit_bias = logit_bias
+        self.repetition_penalty = repetition_penalty
+        self.repetition_context_size = repetition_context_size
         self._stats = BatchStats()
 
         self.active_batch = None
 
         if not isinstance(self.stop_tokens, list):
             self.stop_tokens = [self.stop_tokens]
+
+        if repetition_penalty is not None:
+            raise NotImplementedError("repetition_penalty is not implemented yet.")
+        # if repetition_penalty and (
+        #     repetition_penalty < 0 or not isinstance(repetition_penalty, float)
+        # ):
+        #     raise ValueError(
+        #         f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
+        #     )
+
+    def sample(self, logits: mx.array) -> Tuple[mx.array, float]:
+        if self.logit_bias:
+            indices = mx.array(list(self.logit_bias.keys()))
+            values = mx.array(list(self.logit_bias.values()))
+            logits[:, indices] += values
+        logprobs = logits - mx.logsumexp(logits)
+
+        if self.temperature == 0:
+            token = mx.argmax(logits, axis=-1)
+        else:
+            if self.top_p > 0 and self.top_p < 1.0:
+                token = top_p_sampling(logits, self.top_p, self.temperature)
+            else:
+                token = mx.random.categorical(logits * (1 / self.temperature))
+
+        return token, logprobs
 
     def insert(self, prompts, max_tokens: Union[List[int], int, None] = None):
         uids = []
@@ -165,17 +197,13 @@ class BatchGenerator:
         mask = mx.array([p["attention_mask"][0].tolist() for p in inputs])
         image_grid_thw = mx.array([p["image_grid_thw"][0] for p in inputs])
         self._stats.prompt_tokens += mask.sum().item()
-        # left_padding = [max_length - l for l in lengths]
         text_inputs = mx.array([p["input_ids"][0] for p in inputs])
         max_length = text_inputs.shape[1]
         lengths = mask.sum(axis=1).tolist()
         left_padding = [max_length - l for l in lengths]
-        # text_inputs = _left_pad_prompts(text_inputs, max_length=max_length)
 
         prompt_cache = _make_cache(self.model.language_model, left_padding)
 
-        # inputs[0]["image_grid_thw"]
-        # {'image_grid_thw': array([[1, 74, 74]], dtype=int64)}
         outputs = self.model(
             text_inputs,
             pixel_values,
@@ -183,20 +211,8 @@ class BatchGenerator:
             mask=mask,
             image_grid_thw=image_grid_thw,
         )
-        # mx.eval([c.state for c in prompt_cache])
         logits = outputs.logits[:, -1, :]
-        y = self.sampler(logits)
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        # y = self.sampler(logprobs)
-
-        # while inputs.shape[1] > 1:
-        #     n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-        #     self.model(inputs[:, :n_to_process], cache=prompt_cache)
-        #     mx.eval([c.state for c in prompt_cache])
-        #     inputs = inputs[:, n_to_process:]
-        #     mx.clear_cache()
-
-        # mx.async_eval(y, logprobs)
+        y, logprobs = self.sample(logits)
         mx.clear_cache()
 
         # Clear intermediate variables to free memory
@@ -222,8 +238,7 @@ class BatchGenerator:
         )
         # logits = logits[:, -1, :]
         logits = outputs.logits[:, -1, :]
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        y = self.sampler(logits)
+        y, logprobs = self.sample(logits)
         del outputs, logits
 
         return y, logprobs
@@ -304,19 +319,9 @@ class BatchGenerator:
             responses.append(self.Response(uid, t, logprobs[e], finish_reason))
 
         # Remove any finished completions
-        # if len(end_idx) > 0:
-        #     print(
-        #         f"Finished {len(end_idx)} completions.",
-        #         end_idx,
-        #         "Remaining:",
-        #         len(keep_idx),
-        #     )
         if len(end_idx):
             if len(keep_idx) > 0:
                 batch.filter(keep_idx)
-                # self.model.language_model.rope_deltas = (
-                #     self.model.language_model.rope_deltas[keep_idx]
-                # )
             else:
                 self.active_batch = None
 
