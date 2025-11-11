@@ -149,7 +149,8 @@ class BatchGenerator:
             self.stop_tokens = [self.stop_tokens]
 
         if repetition_penalty is not None:
-            raise NotImplementedError("repetition_penalty is not implemented yet.")
+            if repetition_penalty != 1.0:
+                raise NotImplementedError("repetition_penalty is not implemented yet.")
         # if repetition_penalty and (
         #     repetition_penalty < 0 or not isinstance(repetition_penalty, float)
         # ):
